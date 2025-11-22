@@ -1,195 +1,158 @@
-# app.py
-import streamlit as st
-import requests
 import os
+import tempfile
+import queue
+import requests
 import json
-from typing import List
+import numpy as np
+import soundfile as sf
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
 
-st.set_page_config(page_title="Voice Interview Bot — Streamlit", layout="centered")
+st.set_page_config(page_title="Voice Interview Bot — Streamlit (webrtc)", layout="centered")
+st.title("Voice Interview Bot — Reliable Server-side Recorder")
 
-st.title("Voice Interview Bot (for 100x Stage 1)")
 st.markdown(
     """
-This demo uses your **persona summary** to answer interview questions in a voice-like style.
-- Click **Start recording** and ask a question out loud.
-- The browser transcribes (Web Speech API) and sends text to this app.
-- The app calls OpenAI's Chat API (backend) and returns a text reply.
-- The browser will speak the reply using built-in Text-to-Speech.
+This app uses **WebRTC for recording** + **Whisper speech-to-text** + **Chat API**  
+• Click **Start** → speak  
+• Click **Stop**  
+• Then click **Transcribe latest recording**
 """
 )
 
-# --- Persona section (the bot should answer as YOU) ---
-st.sidebar.header("Bot persona (edit to make answers sound like you)")
+# -----------------------
+# Persona Settings
+# -----------------------
+st.sidebar.header("Bot Persona")
 persona = st.sidebar.text_area(
-    "Write a short summary of how you'd answer interview questions (1-5 sentences). Example: 'I'm Raghul — full-stack dev, curious, like clear steps, friendly tone.'",
-    value="I am Raghul Dominick. I'm a pragmatic problem-solver who likes clear explanations, short examples, and a friendly tone. Keep answers concise and confident."
+    "Persona:",
+    value="I am Raghul Dominick. I answer questions clearly, confidently, and in a friendly tone."
 )
 
-st.sidebar.markdown("**Other settings**")
-model = st.sidebar.selectbox("Model (backend)", options=["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"], index=2)
+model = st.sidebar.selectbox(
+    "Model:",
+    ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"], index=2
+)
 
-# --- API key retrieval (from Streamlit secrets or env) ---
-OPENAI_API_KEY = None
-if "OPENAI_API_KEY" in st.secrets:
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-elif os.getenv("OPENAI_API_KEY"):
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
+# -----------------------
+# API Key
+# -----------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
 if not OPENAI_API_KEY:
-    st.warning(
-        "No OPENAI_API_KEY found. For the deployed demo, set OPENAI_API_KEY in Streamlit secrets or the host environment. "
-        "Locally you can set environment variable OPENAI_API_KEY."
-    )
+    st.warning("Missing OPENAI_API_KEY. Set it in environment or Streamlit Secrets.")
 
-# --- Chat history display ---
-if "history" not in st.session_state:
-    st.session_state.history = []
+# -----------------------
+# Audio Processor
+# -----------------------
+audio_queue = queue.Queue()
 
-def call_openai_chat(user_text: str, persona_text: str, model_name: str = "gpt-3.5-turbo") -> str:
-    """
-    Simple wrapper to call OpenAI Chat API via REST.
-    Uses OPENAI_API_KEY from environment/secrets.
-    """
-    if not OPENAI_API_KEY:
-        return "Error: OPENAI_API_KEY not configured on the server."
+class AudioProcessor(AudioProcessorBase):
+    def __init__(self):
+        self.frames = []
+        self.sample_rate = 48000
 
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    def recv(self, frame):
+        arr = frame.to_ndarray()
+        if arr.dtype != np.float32:
+            arr = arr.astype(np.float32) / np.iinfo(arr.dtype).max
+        self.frames.append(arr)
+        return frame
 
-    system_prompt = (
-        "You are an interview voicebot. Answer the user's spoken interview question as if you are the candidate. "
-        "Use the persona below to shape tone and content. Keep answers clear and friendly; when asked for lists use numbered points."
-    )
+    def export_wav(self):
+        if not self.frames:
+            return None
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"Persona summary: {persona_text}"},
-        {"role": "user", "content": user_text}
-    ]
+        audio = np.concatenate(self.frames, axis=0)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)  # convert stereo → mono
 
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "max_tokens": 400,
-        "temperature": 0.7
-    }
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        sf.write(tmp.name, audio, self.sample_rate)
+        tmp.close()
+        self.frames = []
+        audio_queue.put(tmp.name)
+        return tmp.name
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
-    if resp.status_code != 200:
-        return f"OpenAI API error {resp.status_code}: {resp.text}"
-    data = resp.json()
-    # support both streaming and single response shapes; here assume usual completions
-    content = data["choices"][0]["message"]["content"]
-    return content
+# -----------------------
+# WebRTC Widget
+# -----------------------
+st.subheader("🎤 Record Audio")
+webrtc_ctx = webrtc_streamer(
+    key="voice-recorder",
+    mode=WebRtcMode.SENDONLY,
+    audio_processor_factory=AudioProcessor,
+    media_stream_constraints={"audio": True, "video": False},
+)
 
-# --- UI area for voice controls & transcript ---
-st.subheader("Record & ask (browser will transcribe)")
-placeholder = st.empty()
-
-# We embed a small HTML/JS component that uses Web Speech API to transcribe and then send the text back to Streamlit.
-# The JS will call Streamlit.setComponentValue by posting to the window.parent via Streamlit's postMessage.
-recording_component = """
-<div>
-  <p><b>Instructions:</b> Click Start, speak your question, then click Stop. The browser will transcribe and send the text to the app.</p>
-  <button id="start">Start recording</button>
-  <button id="stop" disabled>Stop</button>
-  <p><i>Transcription:</i></p>
-  <div id="transcript" style="min-height:40px;border:1px solid #ddd;padding:8px;"></div>
-</div>
-<script>
-const startBtn = document.getElementById('start');
-const stopBtn = document.getElementById('stop');
-const transcriptDiv = document.getElementById('transcript');
-let recognition;
-if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-  transcriptDiv.innerText = 'Speech recognition not supported in this browser. Use Chrome or Edge on desktop/mobile or test locally on https.';
-} else {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  recognition = new SpeechRecognition();
-  recognition.lang = 'en-IN';
-  recognition.interimResults = true;
-  recognition.continuous = false;
-
-  recognition.onresult = (event) => {
-    let interim = '';
-    let final = '';
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const res = event.results[i];
-      if (res.isFinal) final += res[0].transcript;
-      else interim += res[0].transcript;
-    }
-    transcriptDiv.innerText = final + interim;
-  };
-
-  recognition.onend = () => {
-    stopBtn.disabled = true;
-    startBtn.disabled = false;
-    // send final transcript back to Streamlit via postMessage
-    const finalText = transcriptDiv.innerText;
-    const payload = {type: 'transcript', text: finalText};
-    window.parent.postMessage({isStreamlitMessage: true, scope: 'streamlit:customComponent', args: payload}, '*');
-  };
-
-  startBtn.onclick = () => {
-    recognition.start();
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
-    transcriptDiv.innerText = '';
-  };
-  stopBtn.onclick = () => {
-    recognition.stop();
-  };
-}
-</script>
-"""
-
-# Render the HTML component
-transcript_data = st.components.v1.html(recording_component, height=240)
-
-# The JS will post a message; Streamlit can't directly receive it except via components return.
-# Workaround: use a small polling keyboard input — below we provide a manual fallback.
-st.write("If your browser cannot use voice, type your question here:")
-typed = st.text_input("Or paste the transcription here", key="typed_input")
-
-# Send button
-if st.button("Send to bot"):
-    question = st.session_state.get("typed_input", "").strip()
-    if not question:
-        st.warning("Please type your question or use the Start Recording button to transcribe.")
+# -----------------------
+# Transcription
+# -----------------------
+if st.button("Transcribe latest recording"):
+    if not webrtc_ctx or not webrtc_ctx.audio_processor:
+        st.error("Start the recorder and allow mic permission.")
     else:
-        st.session_state.history.append({"role": "user", "text": question})
-        with st.spinner("Getting reply..."):
-            reply = call_openai_chat(question, persona, model_name=model)
-        st.session_state.history.append({"role": "bot", "text": reply})
-        st.success("Reply received — playing TTS in your browser (if supported).")
-        # display
-        st.markdown("**Bot reply:**")
-        st.write(reply)
-        # send reply to browser for TTS using JS
-        tts_script = f"""
-        <script>
-          const utter = new SpeechSynthesisUtterance({json.dumps(reply)});
-          utter.lang = 'en-US';
-          utter.rate = 1.0;
-          window.speechSynthesis.cancel();
-          window.speechSynthesis.speak(utter);
-        </script>
-        """
-        st.components.v1.html(tts_script, height=0)
+        filename = webrtc_ctx.audio_processor.export_wav()
+        if not filename:
+            st.error("No audio found. Try recording again.")
+        else:
+            st.success(f"Saved: {filename}")
+            st.audio(filename)
 
-# Show history
-st.markdown("---")
-st.subheader("Conversation history")
-for i, m in enumerate(st.session_state.history[::-1]):
-    role = m["role"]
-    txt = m["text"]
-    if role == "user":
-        st.markdown(f"**You:** {txt}")
-    else:
-        st.markdown(f"**Bot:** {txt}")
+            if OPENAI_API_KEY:
+                st.info("Transcribing...")
 
+                with open(filename, "rb") as f:
+                    resp = requests.post(
+                        "https://api.openai.com/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                        data={"model": "whisper-1"},
+                        files={"file": f},
+                    )
+
+                if resp.status_code == 200:
+                    text = resp.json()["text"]
+                    st.success("Transcription:")
+                    st.write(text)
+
+                    # Chat API
+                    st.info("Getting bot reply...")
+
+                    system_prompt = (
+                        "You are an interview candidate. "
+                        "Answer clearly and professionally using the persona."
+                    )
+
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "system", "content": f"Persona: {persona}"},
+                        {"role": "user", "content": text},
+                    ]
+
+                    reply = requests.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                        json={"model": model, "messages": messages},
+                    ).json()["choices"][0]["message"]["content"]
+
+                    st.subheader("🤖 Bot Reply")
+                    st.write(reply)
+
+                    st.components.v1.html(
+                        f"""
+                        <script>
+                        var u = new SpeechSynthesisUtterance({json.dumps(reply)});
+                        speechSynthesis.speak(u);
+                        </script>
+                        """,
+                        height=0,
+                    )
+
+                else:
+                    st.error(resp.text)
+            else:
+                st.error("Missing key.")
+
+# -----------------------
+# History
+# -----------------------
 st.markdown("---")
-st.markdown("**Deployment notes**: Set the `OPENAI_API_KEY` in Streamlit Secrets (or the environment). The browser must have microphone permission and run on HTTPS for Web Speech API to work reliably.")
