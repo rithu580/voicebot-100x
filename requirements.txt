@@ -1,2 +1,6 @@
 streamlit
+streamlit-webrtc
 requests
+numpy
+soundfile
+pydub
